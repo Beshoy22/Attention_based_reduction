@@ -113,7 +113,7 @@ def main():
     }
     
     early_stopping_config = {
-        'patience': 20,
+        'patience': args.patience,
         'min_delta': 1e-4,
         'restore_best_weights': True
     }

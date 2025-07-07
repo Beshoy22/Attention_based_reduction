@@ -55,6 +55,8 @@ class Config:
                                 help='Weight for prediction loss')
         self.parser.add_argument('--reconstruct_all', action='store_true',
                                 help='Reconstruct entire input (176 vectors) instead of only attended features')
+        self.parser.add_argument('--patience', type=int, default=20,
+                                help='Number of epochs to wait before early stopping')
         
         # System arguments
         self.parser.add_argument('--device', type=str, default='cuda',
@@ -70,20 +72,14 @@ class Config:
         self.parser.add_argument('--reconstruction-evaluation', action='store_true',
                                 help='Perform detailed reconstruction evaluation (time-consuming)')
         
-        # Model type
-        self.parser.add_argument('--model_type', type=str, choices=['autoencoder', 'endtoend', 'survival'],
-                                required=True, help='Type of model to train')
     
     def parse_args(self):
         args = self.parser.parse_args()
         
         # Validate survival analysis arguments
-        if args.survival_analysis or args.model_type == 'survival':
+        if args.survival_analysis:
             if 'survival' not in args.endpoints:
                 args.endpoints = ['survival']
-            if args.model_type != 'survival':
-                print("Warning: --survival-analysis flag set, forcing model_type to 'survival'")
-                args.model_type = 'survival'
             if args.selection_metric not in ['loss', 'c_index']:
                 print("Warning: For survival analysis, setting selection_metric to 'c_index'")
                 args.selection_metric = 'c_index'
