@@ -61,6 +61,134 @@ class MetricsCalculator:
         metrics['f1'] = f1
         
         return metrics
+    
+    @staticmethod
+    def calculate_survival_metrics(y_time: np.ndarray, y_event: np.ndarray, y_pred_hazard: np.ndarray) -> Dict[str, float]:
+        """
+        Calculate survival analysis metrics including C-Index
+        
+        Args:
+            y_time: Survival times
+            y_event: Event indicators (1 if event occurred, 0 if censored)
+            y_pred_hazard: Predicted log hazard ratios
+            
+        Returns:
+            Dictionary of survival metrics
+        """
+        metrics = {}
+        
+        # Calculate Concordance Index (C-Index)
+        try:
+            c_index = MetricsCalculator._calculate_concordance_index(y_time, y_event, y_pred_hazard)
+            metrics['c_index'] = c_index
+        except Exception as e:
+            warnings.warn(f"Failed to calculate C-Index: {e}")
+            metrics['c_index'] = 0.5
+        
+        # Calculate percentage of events
+        metrics['event_rate'] = np.mean(y_event)
+        
+        # Calculate median survival time for events
+        event_times = y_time[y_event == 1]
+        if len(event_times) > 0:
+            metrics['median_event_time'] = np.median(event_times)
+        else:
+            metrics['median_event_time'] = np.nan
+        
+        return metrics
+    
+    @staticmethod
+    def _calculate_concordance_index(time: np.ndarray, event: np.ndarray, risk_score: np.ndarray) -> float:
+        """
+        Calculate Harrell's Concordance Index (C-Index) for survival analysis
+        
+        The C-Index measures the proportion of all pairs of patients where the patient
+        with higher risk score has shorter survival time.
+        
+        Args:
+            time: Survival times
+            event: Event indicators (1 if event occurred, 0 if censored)
+            risk_score: Predicted risk scores (higher score = higher risk)
+            
+        Returns:
+            C-Index value between 0 and 1 (0.5 = random, 1.0 = perfect)
+        """
+        # Convert to numpy arrays and handle NaN values
+        time = np.asarray(time)
+        event = np.asarray(event)
+        risk_score = np.asarray(risk_score)
+        
+        # Remove any NaN or invalid values
+        valid_mask = (~np.isnan(time)) & (~np.isnan(event)) & (~np.isnan(risk_score))
+        if not valid_mask.any():
+            warnings.warn("No valid data for C-Index calculation")
+            return 0.5
+        
+        time = time[valid_mask]
+        event = event[valid_mask] 
+        risk_score = risk_score[valid_mask]
+        
+        if len(time) < 2:
+            warnings.warn("Not enough samples for C-Index calculation")
+            return 0.5
+        
+        # Count concordant, discordant, and tied pairs
+        concordant = 0
+        discordant = 0
+        tied = 0
+        comparable = 0
+        
+        n = len(time)
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Only consider pairs where we can determine the ordering
+                if event[i] == 1 or event[j] == 1:
+                    comparable += 1
+                    
+                    # Determine which patient has worse outcome (shorter survival)
+                    if event[i] == 1 and event[j] == 1:
+                        # Both have events - compare times directly
+                        if time[i] < time[j]:
+                            worse_idx, better_idx = i, j
+                        elif time[i] > time[j]:
+                            worse_idx, better_idx = j, i
+                        else:
+                            # Tied times
+                            tied += 1
+                            continue
+                    elif event[i] == 1:
+                        # Patient i has event, j is censored
+                        if time[i] <= time[j]:
+                            worse_idx, better_idx = i, j
+                        else:
+                            # Can't determine ordering (event after censoring)
+                            comparable -= 1
+                            continue
+                    else:
+                        # Patient j has event, i is censored
+                        if time[j] <= time[i]:
+                            worse_idx, better_idx = j, i
+                        else:
+                            # Can't determine ordering (event after censoring)
+                            comparable -= 1
+                            continue
+                    
+                    # Check if risk scores are concordant with outcomes
+                    if risk_score[worse_idx] > risk_score[better_idx]:
+                        concordant += 1
+                    elif risk_score[worse_idx] < risk_score[better_idx]:
+                        discordant += 1
+                    else:
+                        tied += 1
+        
+        if comparable == 0:
+            warnings.warn("No comparable pairs for C-Index calculation")
+            return 0.5
+        
+        # C-Index = (concordant + 0.5 * tied) / (concordant + discordant + tied)
+        c_index = (concordant + 0.5 * tied) / comparable
+        
+        return c_index
 
 def train_epoch_autoencoder(
     model: nn.Module,
@@ -170,7 +298,18 @@ def train_epoch_endtoend(
         features = features[valid_indices]
         targets = {}
         for ep in endpoints:
-            targets[ep] = torch.stack([batch['endpoints'][ep][i] for i in valid_indices]).to(device)
+            if ep == 'survival':
+                # Handle survival data for endtoend training
+                survival_data = [batch['endpoints'][ep][i] for i in valid_indices]
+                if all(data is not None and isinstance(data, dict) and 'time' in data and 'event' in data for data in survival_data):
+                    times = torch.stack([data['time'] for data in survival_data]).to(device)
+                    events = torch.stack([data['event'] for data in survival_data]).to(device)
+                    targets[ep] = {'time': times, 'event': events}
+                else:
+                    # Skip this batch if survival data is invalid
+                    continue
+            else:
+                targets[ep] = torch.stack([batch['endpoints'][ep][i] for i in valid_indices]).to(device)
         
         # Forward pass
         _, predictions = model(features)
@@ -198,6 +337,72 @@ def train_epoch_endtoend(
                   for key, total in total_losses.items()}
     
     return avg_losses
+
+def train_epoch_survival(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: 'CoxPHLoss',
+    optimizer_manager: 'OptimizerManager',
+    device: str
+) -> Dict[str, float]:
+    """
+    Train one epoch for survival model
+    """
+    model.train()
+    
+    total_loss = 0.0
+    num_batches = 0
+    
+    for batch in dataloader:
+        if batch is None:  # Skip invalid batches from collate_fn
+            continue
+            
+        features = batch['features'].to(device)
+        
+        # Extract survival data
+        survival_data = batch['endpoints']['survival']
+        if survival_data is None:
+            continue
+            
+        valid_indices = []
+        times = []
+        events = []
+        
+        for i, data in enumerate(survival_data):
+            if (data is not None and isinstance(data, dict) and 
+                'time' in data and 'event' in data):
+                valid_indices.append(i)
+                times.append(data['time'])
+                events.append(data['event'])
+        
+        if len(valid_indices) == 0:
+            continue
+        
+        # Filter to valid samples
+        features = features[valid_indices]
+        times = torch.stack(times).to(device)
+        events = torch.stack(events).to(device)
+        
+        # Forward pass
+        log_hazards = model(features).squeeze()
+        
+        # Calculate loss
+        loss = criterion(log_hazards, times, events)
+        
+        # Backward pass
+        optimizer_manager.zero_grad()
+        loss.backward()
+        
+        # Clip gradients to prevent explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        optimizer_manager.step()
+        
+        total_loss += loss.item()
+        num_batches += 1
+    
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    return {'total': avg_loss, 'survival': avg_loss}
 
 def evaluate_model(
     model: nn.Module,
@@ -257,7 +462,18 @@ def evaluate_model(
                 features = features[valid_indices]
                 targets = {}
                 for ep in endpoints:
-                    targets[ep] = torch.stack([batch['endpoints'][ep][i] for i in valid_indices]).to(device)
+                    if ep == 'survival':
+                        # Handle survival data for endtoend model
+                        survival_data = [batch['endpoints'][ep][i] for i in valid_indices]
+                        if all(data is not None and isinstance(data, dict) and 'time' in data and 'event' in data for data in survival_data):
+                            times = torch.stack([data['time'] for data in survival_data]).to(device)
+                            events = torch.stack([data['event'] for data in survival_data]).to(device)
+                            targets[ep] = {'time': times, 'event': events}
+                        else:
+                            # Skip this batch if survival data is invalid
+                            continue
+                    else:
+                        targets[ep] = torch.stack([batch['endpoints'][ep][i] for i in valid_indices]).to(device)
                 
                 # Forward pass
                 _, predictions = model(features)
@@ -267,15 +483,33 @@ def evaluate_model(
                 
                 # Store predictions for metrics and saving
                 for ep in endpoints:
-                    all_targets[ep].extend(targets[ep].cpu().numpy())
-                    
-                    if ep in ['stage_t', 'stage_n']:
-                        # Multiclass: get predicted classes
-                        pred_classes = torch.argmax(predictions[ep], dim=1)
-                        all_predictions[ep].extend(pred_classes.cpu().numpy())
+                    if ep == 'survival':
+                        # Handle survival data - targets[ep] is dict with 'time' and 'event'
+                        if isinstance(targets[ep], dict) and 'time' in targets[ep] and 'event' in targets[ep]:
+                            times = targets[ep]['time'].cpu().numpy()
+                            events = targets[ep]['event'].cpu().numpy()
+                            hazard_pred = predictions[ep].squeeze().cpu().numpy()
+                            
+                            # Store all survival data together
+                            if 'survival_time' not in all_targets:
+                                all_targets['survival_time'] = []
+                                all_targets['survival_event'] = []
+                                all_predictions['survival_hazard'] = []
+                            
+                            all_targets['survival_time'].extend(times)
+                            all_targets['survival_event'].extend(events)
+                            all_predictions['survival_hazard'].extend(hazard_pred)
                     else:
-                        # Binary: get probabilities
-                        all_predictions[ep].extend(predictions[ep].squeeze().cpu().numpy())
+                        # Handle traditional endpoints
+                        all_targets[ep].extend(targets[ep].cpu().numpy())
+                        
+                        if ep in ['stage_t', 'stage_n']:
+                            # Multiclass: get predicted classes
+                            pred_classes = torch.argmax(predictions[ep], dim=1)
+                            all_predictions[ep].extend(pred_classes.cpu().numpy())
+                        else:
+                            # Binary: get probabilities
+                            all_predictions[ep].extend(predictions[ep].squeeze().cpu().numpy())
                 
                 # Store patient IDs
                 all_patient_ids.extend([batch['patient_id'][i] for i in valid_indices])
@@ -303,21 +537,42 @@ def evaluate_model(
                 # Store predictions for metrics and saving (only for specified endpoints with targets)
                 for ep in endpoints:
                     if targets[ep] is not None:
-                        valid_mask = targets[ep] != -1
-                        if valid_mask.any():
-                            all_targets[ep].extend(targets[ep][valid_mask].cpu().numpy())
-                            
-                            if ep in ['stage_t', 'stage_n']:
-                                # Multiclass: get predicted classes
-                                pred_classes = torch.argmax(predictions[ep][valid_mask], dim=1)
-                                all_predictions[ep].extend(pred_classes.cpu().numpy())
-                            else:
-                                # Binary: get probabilities
-                                all_predictions[ep].extend(predictions[ep].squeeze()[valid_mask].cpu().numpy())
-                            
-                            # Store patient IDs for valid predictions
-                            valid_patient_ids = [batch['patient_id'][i] for i in range(len(batch['patient_id'])) if valid_mask[i]]
-                            all_patient_ids.extend(valid_patient_ids)
+                        if ep == 'survival':
+                            # Handle survival data - targets[ep] is dict with 'time' and 'event'
+                            if isinstance(targets[ep], dict) and 'time' in targets[ep] and 'event' in targets[ep]:
+                                times = targets[ep]['time'].cpu().numpy()
+                                events = targets[ep]['event'].cpu().numpy()
+                                hazard_pred = predictions[ep].squeeze().cpu().numpy()
+                                
+                                # Store all survival data together
+                                if 'survival_time' not in all_targets:
+                                    all_targets['survival_time'] = []
+                                    all_targets['survival_event'] = []
+                                    all_predictions['survival_hazard'] = []
+                                
+                                all_targets['survival_time'].extend(times)
+                                all_targets['survival_event'].extend(events)
+                                all_predictions['survival_hazard'].extend(hazard_pred)
+                                
+                                # Store patient IDs for survival predictions
+                                all_patient_ids.extend(batch['patient_id'][:len(times)])
+                        else:
+                            # Handle traditional endpoints
+                            valid_mask = targets[ep] != -1
+                            if valid_mask.any():
+                                all_targets[ep].extend(targets[ep][valid_mask].cpu().numpy())
+                                
+                                if ep in ['stage_t', 'stage_n']:
+                                    # Multiclass: get predicted classes
+                                    pred_classes = torch.argmax(predictions[ep][valid_mask], dim=1)
+                                    all_predictions[ep].extend(pred_classes.cpu().numpy())
+                                else:
+                                    # Binary: get probabilities
+                                    all_predictions[ep].extend(predictions[ep].squeeze()[valid_mask].cpu().numpy())
+                                
+                                # Store patient IDs for valid predictions
+                                valid_patient_ids = [batch['patient_id'][i] for i in range(len(batch['patient_id'])) if valid_mask[i]]
+                                all_patient_ids.extend(valid_patient_ids)
             
             # Accumulate losses
             for key in total_losses.keys():
@@ -337,19 +592,31 @@ def evaluate_model(
     # Calculate metrics (only for specified endpoints)
     metrics = {}
     for ep in endpoints:
-        if len(all_targets[ep]) > 0:
-            if ep in ['stage_t', 'stage_n']:
-                # Multiclass: predictions are already class indices
-                ep_metrics = MetricsCalculator.calculate_multiclass_metrics(
-                    np.array(all_targets[ep]), np.array(all_predictions[ep])
+        if ep == 'survival':
+            # Handle survival metrics
+            if ('survival_time' in all_targets and 'survival_event' in all_targets and 
+                'survival_hazard' in all_predictions and len(all_targets['survival_time']) > 0):
+                ep_metrics = MetricsCalculator.calculate_survival_metrics(
+                    np.array(all_targets['survival_time']),
+                    np.array(all_targets['survival_event']),
+                    np.array(all_predictions['survival_hazard'])
                 )
-            else:
-                # Binary: convert probabilities to binary predictions
-                ep_pred_binary = (np.array(all_predictions[ep]) > 0.5).astype(int)
-                ep_metrics = MetricsCalculator.calculate_binary_metrics(
-                    np.array(all_targets[ep]), ep_pred_binary, np.array(all_predictions[ep])
-                )
-            metrics[ep] = ep_metrics
+                metrics['survival'] = ep_metrics
+        else:
+            # Handle traditional endpoints
+            if len(all_targets[ep]) > 0:
+                if ep in ['stage_t', 'stage_n']:
+                    # Multiclass: predictions are already class indices
+                    ep_metrics = MetricsCalculator.calculate_multiclass_metrics(
+                        np.array(all_targets[ep]), np.array(all_predictions[ep])
+                    )
+                else:
+                    # Binary: convert probabilities to binary predictions
+                    ep_pred_binary = (np.array(all_predictions[ep]) > 0.5).astype(int)
+                    ep_metrics = MetricsCalculator.calculate_binary_metrics(
+                        np.array(all_targets[ep]), ep_pred_binary, np.array(all_predictions[ep])
+                    )
+                metrics[ep] = ep_metrics
     
     # Save predictions if requested
     if save_predictions and save_path and all_patient_ids:
@@ -364,16 +631,26 @@ def evaluate_model(
                 record = {'patient_id': patient_id}
                 
                 for ep in endpoints:
-                    if idx < len(all_targets[ep]):
-                        record[f'{ep}_true'] = all_targets[ep][idx]
-                        
-                        if ep in ['stage_t', 'stage_n']:
-                            # Multiclass: prediction is class index
-                            record[f'{ep}_pred'] = all_predictions[ep][idx]
-                        else:
-                            # Binary: prediction is probability and binary
-                            record[f'{ep}_pred'] = all_predictions[ep][idx]
-                            record[f'{ep}_pred_binary'] = int(all_predictions[ep][idx] > 0.5)
+                    if ep == 'survival':
+                        # Handle survival predictions
+                        if (idx < len(all_targets.get('survival_time', [])) and 
+                            idx < len(all_targets.get('survival_event', [])) and
+                            idx < len(all_predictions.get('survival_hazard', []))):
+                            record['survival_time_true'] = all_targets['survival_time'][idx]
+                            record['survival_event_true'] = all_targets['survival_event'][idx]
+                            record['survival_hazard_pred'] = all_predictions['survival_hazard'][idx]
+                    else:
+                        # Handle traditional endpoints
+                        if idx < len(all_targets[ep]):
+                            record[f'{ep}_true'] = all_targets[ep][idx]
+                            
+                            if ep in ['stage_t', 'stage_n']:
+                                # Multiclass: prediction is class index
+                                record[f'{ep}_pred'] = all_predictions[ep][idx]
+                            else:
+                                # Binary: prediction is probability and binary
+                                record[f'{ep}_pred'] = all_predictions[ep][idx]
+                                record[f'{ep}_pred_binary'] = int(all_predictions[ep][idx] > 0.5)
                 
                 pred_data.append(record)
         
@@ -406,7 +683,7 @@ def train_model(
         optimizer_manager: Optimizer manager
         epochs: Number of epochs
         device: Device to run on
-        model_type: 'autoencoder' or 'endtoend'
+        model_type: 'autoencoder', 'endtoend', or 'survival'
         save_dir: Directory to save results
         save_best: Whether to save best model
     
@@ -430,8 +707,18 @@ def train_model(
                 aucs.append(metrics[ep].get('auc', 0.0))
         return np.mean(aucs) if aucs else 0.0
     
+    def get_validation_metric(metrics: Dict, metric_type: str) -> float:
+        """Get validation metric for model selection"""
+        if metric_type == 'c_index':
+            return metrics.get('survival', {}).get('c_index', 0.5)
+        elif metric_type == 'auc':
+            return compute_combined_auc(metrics)
+        else:  # loss
+            return 0.0  # Will use val_loss instead
+    
     best_val_loss = float('inf')
     best_val_auc = 0.0
+    best_val_c_index = 0.0
     
     print(f"Starting training for {epochs} epochs...")
     print(f"Model type: {model_type}")
@@ -444,6 +731,10 @@ def train_model(
         if model_type == 'autoencoder':
             train_losses = train_epoch_autoencoder(
                 model, train_loader, criterion, optimizer_manager, device, endpoints
+            )
+        elif model_type == 'survival':
+            train_losses = train_epoch_survival(
+                model, train_loader, criterion, optimizer_manager, device
             )
         else:
             train_losses = train_epoch_endtoend(
@@ -462,9 +753,16 @@ def train_model(
         # Update learning rate and check early stopping
         val_loss = val_losses['total']
         val_auc = compute_combined_auc(val_metrics)
+        val_c_index = get_validation_metric(val_metrics, 'c_index')
         
         # Use appropriate metric for scheduler and early stopping
-        scheduler_metric = val_loss if selection_metric == 'loss' else -val_auc  # Negative AUC for minimization
+        if selection_metric == 'loss':
+            scheduler_metric = val_loss
+        elif selection_metric == 'c_index':
+            scheduler_metric = -val_c_index  # Negative C-Index for minimization
+        else:  # auc
+            scheduler_metric = -val_auc  # Negative AUC for minimization
+        
         early_stop = optimizer_manager.step(scheduler_metric)
         
         # Save best model based on selection metric
@@ -478,6 +776,10 @@ def train_model(
                 best_val_auc = val_auc
                 save_current = True
                 print(f"  New best validation AUC: {val_auc:.4f}")
+            elif selection_metric == 'c_index' and val_c_index > best_val_c_index:
+                best_val_c_index = val_c_index
+                save_current = True
+                print(f"  New best validation C-Index: {val_c_index:.4f}")
             
             if save_current:
                 torch.save({
@@ -486,6 +788,7 @@ def train_model(
                     'optimizer_state_dict': optimizer_manager.state_dict(),
                     'val_loss': val_loss,
                     'val_auc': val_auc,
+                    'val_c_index': val_c_index,
                     'val_metrics': val_metrics
                 }, os.path.join(save_dir, 'best_model.pth'))
         
@@ -506,7 +809,9 @@ def train_model(
             print(f"  Val Cosine Sim: {val_losses['cosine_similarity']:.4f}")
         for ep in endpoints:
             if ep in val_metrics:
-                if ep in ['stage_t', 'stage_n']:
+                if ep == 'survival':
+                    print(f"  Val {ep.upper()} C-Index: {val_metrics[ep]['c_index']:.4f}")
+                elif ep in ['stage_t', 'stage_n']:
                     print(f"  Val {ep.upper()} Acc: {val_metrics[ep]['accuracy']:.4f}")
                 else:
                     print(f"  Val {ep.upper()} AUC: {val_metrics[ep]['auc']:.4f}")
@@ -527,19 +832,30 @@ def train_model(
     }, os.path.join(save_dir, 'final_model.pth'))
     
     # Save history as JSON
+    def convert_to_json_serializable(obj):
+        """Convert numpy types to Python native types for JSON serialization"""
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_to_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_json_serializable(v) for v in obj]
+        else:
+            return obj
+    
     with open(os.path.join(save_dir, 'training_history.json'), 'w') as f:
-        # Convert tensors to lists for JSON serialization
-        json_history = {}
-        for key, value in history.items():
-            if key in ['train_loss', 'val_loss']:
-                json_history[key] = value
-            else:
-                json_history[key] = [float(v) if isinstance(v, (int, float)) else v for v in value]
+        json_history = convert_to_json_serializable(history)
         json.dump(json_history, f, indent=2)
     
     print("Training completed!")
     if selection_metric == 'loss':
         print(f"Best validation loss: {best_val_loss:.4f}")
+    elif selection_metric == 'c_index':
+        print(f"Best validation C-Index: {best_val_c_index:.4f}")
     else:
         print(f"Best validation AUC: {best_val_auc:.4f}")
     

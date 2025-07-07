@@ -170,7 +170,10 @@ def main():
         print(f"Test Cosine Sim: {test_losses['cosine_similarity']:.4f}")
     for ep in args.endpoints:
         if ep in test_metrics:
-            if ep in ['stage_t', 'stage_n']:
+            if ep == 'survival':
+                print(f"{ep.upper()} - C-Index: {test_metrics[ep]['c_index']:.4f}, "
+                      f"Event Rate: {test_metrics[ep]['event_rate']:.4f}")
+            elif ep in ['stage_t', 'stage_n']:
                 print(f"{ep.upper()} - Accuracy: {test_metrics[ep]['accuracy']:.4f}, "
                       f"F1: {test_metrics[ep]['f1']:.4f}")
             else:

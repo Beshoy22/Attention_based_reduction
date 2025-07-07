@@ -34,10 +34,12 @@ class Config:
         
         # Training arguments
         self.parser.add_argument('--endpoints', nargs='+', 
-                                choices=['os6', 'os24', 'stage_t', 'stage_n', 'stage_m'], 
+                                choices=['os6', 'os24', 'stage_t', 'stage_n', 'stage_m', 'survival'], 
                                 default=['os6', 'os24'],
                                 help='Which endpoints to train on')
-        self.parser.add_argument('--selection_metric', type=str, choices=['loss', 'auc'], 
+        self.parser.add_argument('--survival_analysis', action='store_true',
+                                help='Enable survival analysis mode with Cox Proportional Hazards')
+        self.parser.add_argument('--selection_metric', type=str, choices=['loss', 'auc', 'c_index'], 
                                 default='loss', help='Metric for best model selection')
         self.parser.add_argument('--batch_size', type=int, default=16,
                                 help='Batch size')
@@ -69,11 +71,24 @@ class Config:
                                 help='Perform detailed reconstruction evaluation (time-consuming)')
         
         # Model type
-        self.parser.add_argument('--model_type', type=str, choices=['autoencoder', 'endtoend'],
+        self.parser.add_argument('--model_type', type=str, choices=['autoencoder', 'endtoend', 'survival'],
                                 required=True, help='Type of model to train')
     
     def parse_args(self):
-        return self.parser.parse_args()
+        args = self.parser.parse_args()
+        
+        # Validate survival analysis arguments
+        if args.survival_analysis or args.model_type == 'survival':
+            if 'survival' not in args.endpoints:
+                args.endpoints = ['survival']
+            if args.model_type != 'survival':
+                print("Warning: --survival-analysis flag set, forcing model_type to 'survival'")
+                args.model_type = 'survival'
+            if args.selection_metric not in ['loss', 'c_index']:
+                print("Warning: For survival analysis, setting selection_metric to 'c_index'")
+                args.selection_metric = 'c_index'
+        
+        return args
 
 def load_train_test_split(json_path: str) -> dict:
     """Load train/test split from JSON file"""

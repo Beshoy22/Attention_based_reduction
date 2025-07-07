@@ -58,8 +58,14 @@ def filter_patients_with_nan_features(data: List[Dict]) -> List[Dict]:
 
 def custom_collate_fn(batch):
     """
-    Custom collate function to handle None values in endpoints
+    Custom collate function to handle None values in endpoints and invalid patients
     """
+    # Filter out None items (patients with invalid survival data)
+    batch = [item for item in batch if item is not None]
+    
+    if not batch:
+        return None  # Return None if all items in batch are invalid
+    
     # Separate the batch elements
     features = torch.stack([item['features'] for item in batch])
     patient_ids = [item['patient_id'] for item in batch]
@@ -96,7 +102,8 @@ class MedicalImagingDataset(Dataset):
             'os6': 'OS_6', 'os24': 'OS_24',
             'stage_t': 'STAGE_DIAGNOSIS_T',
             'stage_n': 'STAGE_DIAGNOSIS_N', 
-            'stage_m': 'STAGE_DIAGNOSIS_M'
+            'stage_m': 'STAGE_DIAGNOSIS_M',
+            'survival': ['OS_MONTHS', 'DEATH_EVENT_OC']  # Survival analysis endpoints
         }
         
         for patient in data:
@@ -104,8 +111,19 @@ class MedicalImagingDataset(Dataset):
                 self.data.append(patient)
             else:
                 # Require ALL specified endpoints to be present
-                has_all = all(endpoint_map[ep] in patient and patient[endpoint_map[ep]] is not None 
-                             for ep in endpoints)
+                has_all = True
+                for ep in endpoints:
+                    if ep == 'survival':
+                        # For survival analysis, need both OS_MONTHS and DEATH_EVENT_OC
+                        survival_keys = endpoint_map[ep]
+                        if not all(key in patient and patient[key] is not None for key in survival_keys):
+                            has_all = False
+                            break
+                    else:
+                        # For other endpoints, check single key
+                        if endpoint_map[ep] not in patient or patient[endpoint_map[ep]] is None:
+                            has_all = False
+                            break
                 if has_all:
                     self.data.append(patient)
     
@@ -128,25 +146,53 @@ class MedicalImagingDataset(Dataset):
             'os6': 'OS_6', 'os24': 'OS_24',
             'stage_t': 'STAGE_DIAGNOSIS_T',
             'stage_n': 'STAGE_DIAGNOSIS_N', 
-            'stage_m': 'STAGE_DIAGNOSIS_M'
+            'stage_m': 'STAGE_DIAGNOSIS_M',
+            'survival': ['OS_MONTHS', 'DEATH_EVENT_OC']  # Survival analysis endpoints
         }
         
         # Get endpoints if available
         endpoint_values = {}
         for ep in self.endpoints:
-            key = endpoint_map[ep]
-            value = patient.get(key, None)
-            if value is not None:
-                # Keep original values for T,N (multiclass), binary for M and survival
-                if ep == 'stage_m':
-                    value = float(value)  # M is already 0/1
-                elif ep in ['stage_t', 'stage_n']:
-                    value = int(value)  # Keep as class indices
-                else:  # os6, os24
-                    value = float(value)
-                endpoint_values[ep] = torch.tensor(value, dtype=torch.long if ep in ['stage_t', 'stage_n'] else torch.float32)
+            if ep == 'survival':
+                # Handle survival analysis endpoints
+                survival_keys = endpoint_map[ep]
+                os_months = patient.get(survival_keys[0], None)
+                death_event = patient.get(survival_keys[1], None)
+                
+                if os_months is not None and death_event is not None:
+                    # Convert to appropriate tensors
+                    os_months = float(os_months)
+                    death_event = float(death_event)
+                    
+                    # Validate survival data - if invalid, this patient should be excluded
+                    if os_months < 0:
+                        warnings.warn(f"WARNING: Patient {patient['patient_id']} excluded due to invalid survival time {os_months} - must be non-negative")
+                        return None  # Signal to exclude this patient
+                    if death_event not in [0.0, 1.0]:
+                        warnings.warn(f"WARNING: Patient {patient['patient_id']} excluded due to invalid death event {death_event} - must be 0 or 1")
+                        return None  # Signal to exclude this patient
+                    
+                    endpoint_values[ep] = {
+                        'time': torch.tensor(os_months, dtype=torch.float32),
+                        'event': torch.tensor(death_event, dtype=torch.float32)
+                    }
+                else:
+                    endpoint_values[ep] = None
             else:
-                endpoint_values[ep] = None
+                # Handle traditional endpoints
+                key = endpoint_map[ep]
+                value = patient.get(key, None)
+                if value is not None:
+                    # Keep original values for T,N (multiclass), binary for M and survival
+                    if ep == 'stage_m':
+                        value = float(value)  # M is already 0/1
+                    elif ep in ['stage_t', 'stage_n']:
+                        value = int(value)  # Keep as class indices
+                    else:  # os6, os24
+                        value = float(value)
+                    endpoint_values[ep] = torch.tensor(value, dtype=torch.long if ep in ['stage_t', 'stage_n'] else torch.float32)
+                else:
+                    endpoint_values[ep] = None
         
         return {
             'features': features,
@@ -185,7 +231,8 @@ def stratified_split_by_center_and_endpoints(
         'os6': 'OS_6', 'os24': 'OS_24',
         'stage_t': 'STAGE_DIAGNOSIS_T',
         'stage_n': 'STAGE_DIAGNOSIS_N', 
-        'stage_m': 'STAGE_DIAGNOSIS_M'
+        'stage_m': 'STAGE_DIAGNOSIS_M',
+        'survival': ['OS_MONTHS', 'DEATH_EVENT_OC']
     }
     
     # Priority order for endpoints (OS_6 and OS_24 first)
@@ -209,12 +256,22 @@ def stratified_split_by_center_and_endpoints(
             endpoint_values = []
             has_all_endpoints = True
             for ep in current_endpoints:
-                key = endpoint_map[ep]
-                if key in patient and patient[key] is not None:
-                    endpoint_values.append(str(int(patient[key])))
+                if ep == 'survival':
+                    # For survival, check both OS_MONTHS and DEATH_EVENT_OC
+                    survival_keys = endpoint_map[ep]
+                    if all(key in patient and patient[key] is not None for key in survival_keys):
+                        # Use death event as stratification value for survival
+                        endpoint_values.append(str(int(patient[survival_keys[1]])))
+                    else:
+                        has_all_endpoints = False
+                        break
                 else:
-                    has_all_endpoints = False
-                    break
+                    key = endpoint_map[ep]
+                    if key in patient and patient[key] is not None:
+                        endpoint_values.append(str(int(patient[key])))
+                    else:
+                        has_all_endpoints = False
+                        break
             
             if has_all_endpoints:
                 label = f"{center}_{'_'.join(endpoint_values)}"
@@ -280,7 +337,8 @@ def create_automatic_train_val_test_split(
         'os6': 'OS_6', 'os24': 'OS_24',
         'stage_t': 'STAGE_DIAGNOSIS_T',
         'stage_n': 'STAGE_DIAGNOSIS_N', 
-        'stage_m': 'STAGE_DIAGNOSIS_M'
+        'stage_m': 'STAGE_DIAGNOSIS_M',
+        'survival': ['OS_MONTHS', 'DEATH_EVENT_OC']
     }
     
     # Calculate split sizes: if val_split=0.2, then train=0.6, val=0.2, test=0.2
@@ -310,12 +368,22 @@ def create_automatic_train_val_test_split(
             endpoint_values = []
             has_all_endpoints = True
             for ep in current_endpoints:
-                key = endpoint_map[ep]
-                if key in patient and patient[key] is not None:
-                    endpoint_values.append(str(int(patient[key])))
+                if ep == 'survival':
+                    # For survival, check both OS_MONTHS and DEATH_EVENT_OC
+                    survival_keys = endpoint_map[ep]
+                    if all(key in patient and patient[key] is not None for key in survival_keys):
+                        # Use death event as stratification value for survival
+                        endpoint_values.append(str(int(patient[survival_keys[1]])))
+                    else:
+                        has_all_endpoints = False
+                        break
                 else:
-                    has_all_endpoints = False
-                    break
+                    key = endpoint_map[ep]
+                    if key in patient and patient[key] is not None:
+                        endpoint_values.append(str(int(patient[key])))
+                    else:
+                        has_all_endpoints = False
+                        break
             
             if has_all_endpoints:
                 label = f"{center}_{'_'.join(endpoint_values)}"
@@ -343,8 +411,13 @@ def create_automatic_train_val_test_split(
                     center = patient['center']
                     endpoint_values = []
                     for ep in current_endpoints:
-                        key = endpoint_map[ep]
-                        endpoint_values.append(str(int(patient[key])))
+                        if ep == 'survival':
+                            # For survival, use death event as stratification value
+                            survival_keys = endpoint_map[ep]
+                            endpoint_values.append(str(int(patient[survival_keys[1]])))
+                        else:
+                            key = endpoint_map[ep]
+                            endpoint_values.append(str(int(patient[key])))
                     train_val_labels.append(f"{center}_{'_'.join(endpoint_values)}")
                 
                 # Calculate val_size relative to remaining data
@@ -382,28 +455,42 @@ def compute_class_weights(data: List[Dict], endpoints: List[str]) -> Dict[str, t
         'os6': 'OS_6', 'os24': 'OS_24',
         'stage_t': 'STAGE_DIAGNOSIS_T',
         'stage_n': 'STAGE_DIAGNOSIS_N', 
-        'stage_m': 'STAGE_DIAGNOSIS_M'
+        'stage_m': 'STAGE_DIAGNOSIS_M',
+        'survival': ['OS_MONTHS', 'DEATH_EVENT_OC']
     }
     
     weights = {}
     
     for ep in endpoints:
-        key = endpoint_map[ep]
-        values = []
-        for patient in data:
-            if key in patient and patient[key] is not None:
-                values.append(int(patient[key]))
-        
-        if values:
-            unique_classes = np.unique(values)
-            if ep in ['stage_t', 'stage_n']:
-                # Multiclass: compute weight for each class
+        if ep == 'survival':
+            # For survival, use death event for class weights
+            survival_keys = endpoint_map[ep]
+            values = []
+            for patient in data:
+                if all(key in patient and patient[key] is not None for key in survival_keys):
+                    values.append(int(patient[survival_keys[1]]))  # Use death event
+            
+            if values:
+                unique_classes = np.unique(values)
                 ep_weights = compute_class_weight('balanced', classes=unique_classes, y=values)
                 weights[ep] = torch.tensor(ep_weights, dtype=torch.float32)
-            else:
-                # Binary: standard balanced weights
-                ep_weights = compute_class_weight('balanced', classes=unique_classes, y=values)
-                weights[ep] = torch.tensor(ep_weights, dtype=torch.float32)
+        else:
+            key = endpoint_map[ep]
+            values = []
+            for patient in data:
+                if key in patient and patient[key] is not None:
+                    values.append(int(patient[key]))
+            
+            if values:
+                unique_classes = np.unique(values)
+                if ep in ['stage_t', 'stage_n']:
+                    # Multiclass: compute weight for each class
+                    ep_weights = compute_class_weight('balanced', classes=unique_classes, y=values)
+                    weights[ep] = torch.tensor(ep_weights, dtype=torch.float32)
+                else:
+                    # Binary: standard balanced weights
+                    ep_weights = compute_class_weight('balanced', classes=unique_classes, y=values)
+                    weights[ep] = torch.tensor(ep_weights, dtype=torch.float32)
     
     return weights
 
@@ -422,7 +509,8 @@ def filter_patients_with_all_endpoints(data: List[Dict], endpoints: List[str]) -
         'os6': 'OS_6', 'os24': 'OS_24',
         'stage_t': 'STAGE_DIAGNOSIS_T',
         'stage_n': 'STAGE_DIAGNOSIS_N', 
-        'stage_m': 'STAGE_DIAGNOSIS_M'
+        'stage_m': 'STAGE_DIAGNOSIS_M',
+        'survival': ['OS_MONTHS', 'DEATH_EVENT_OC']
     }
     
     filtered_data = []
@@ -431,10 +519,17 @@ def filter_patients_with_all_endpoints(data: List[Dict], endpoints: List[str]) -
     for patient in data:
         has_all = True
         for ep in endpoints:
-            key = endpoint_map[ep]
-            if key not in patient or patient[key] is None:
-                has_all = False
-                break
+            if ep == 'survival':
+                # For survival, check both OS_MONTHS and DEATH_EVENT_OC
+                survival_keys = endpoint_map[ep]
+                if not all(key in patient and patient[key] is not None for key in survival_keys):
+                    has_all = False
+                    break
+            else:
+                key = endpoint_map[ep]
+                if key not in patient or patient[key] is None:
+                    has_all = False
+                    break
         
         if has_all:
             filtered_data.append(patient)
@@ -457,7 +552,8 @@ def validate_target_values(data: List[Dict], endpoints: List[str], strict_valida
         'os6': 'OS_6', 'os24': 'OS_24',
         'stage_t': 'STAGE_DIAGNOSIS_T',
         'stage_n': 'STAGE_DIAGNOSIS_N', 
-        'stage_m': 'STAGE_DIAGNOSIS_M'
+        'stage_m': 'STAGE_DIAGNOSIS_M',
+        'survival': ['OS_MONTHS', 'DEATH_EVENT_OC']
     }
     
     invalid_patients = []

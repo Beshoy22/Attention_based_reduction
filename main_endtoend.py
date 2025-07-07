@@ -140,14 +140,18 @@ def main():
     
     print("\nTest Results:")
     print(f"Test Loss: {test_losses['total']:.4f}")
-    if 'os6' in test_metrics:
-        print(f"OS6 - AUC: {test_metrics['os6']['auc']:.4f}, "
-              f"Accuracy: {test_metrics['os6']['accuracy']:.4f}, "
-              f"F1: {test_metrics['os6']['f1']:.4f}")
-    if 'os24' in test_metrics:
-        print(f"OS24 - AUC: {test_metrics['os24']['auc']:.4f}, "
-              f"Accuracy: {test_metrics['os24']['accuracy']:.4f}, "
-              f"F1: {test_metrics['os24']['f1']:.4f}")
+    for ep in args.endpoints:
+        if ep in test_metrics:
+            if ep == 'survival':
+                print(f"{ep.upper()} - C-Index: {test_metrics[ep]['c_index']:.4f}, "
+                      f"Event Rate: {test_metrics[ep]['event_rate']:.4f}")
+            elif ep in ['stage_t', 'stage_n']:
+                print(f"{ep.upper()} - Accuracy: {test_metrics[ep]['accuracy']:.4f}, "
+                      f"F1: {test_metrics[ep]['f1']:.4f}")
+            else:
+                print(f"{ep.upper()} - AUC: {test_metrics[ep]['auc']:.4f}, "
+                      f"Accuracy: {test_metrics[ep]['accuracy']:.4f}, "
+                      f"F1: {test_metrics[ep]['f1']:.4f}")
     
     # Extract and save reduced features from test set
     print("Extracting reduced features from test set...")

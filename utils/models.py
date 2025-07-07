@@ -122,7 +122,8 @@ class Predictor(nn.Module):
             'os6': 1, 'os24': 1,  # Binary
             'stage_t': 5,  # 0,1,2,3,4
             'stage_n': 4,  # 0,1,2,3  
-            'stage_m': 1   # Binary
+            'stage_m': 1,  # Binary
+            'survival': 1  # Hazard prediction (log hazard ratio)
         }
         
         for ep in endpoints:
@@ -133,9 +134,13 @@ class Predictor(nn.Module):
         predictions = {}
         for ep, head in self.endpoint_heads.items():
             pred = head(features)
-            # Apply sigmoid only for binary endpoints
+            # Apply appropriate activation functions
             if ep in ['os6', 'os24', 'stage_m']:
+                # Binary endpoints: apply sigmoid
                 predictions[ep] = torch.sigmoid(pred)
+            elif ep == 'survival':
+                # Survival endpoint: no activation (log hazard ratio)
+                predictions[ep] = pred
             else:  # stage_t, stage_n - multiclass, no sigmoid
                 predictions[ep] = pred
         return predictions
@@ -250,12 +255,76 @@ class EndToEndModel(nn.Module):
         
         return features, predictions
 
+class SurvivalModel(nn.Module):
+    """
+    Survival analysis model with attention mechanism
+    Specialized for survival analysis with Cox Proportional Hazards
+    """
+    def __init__(
+        self,
+        attention_k: int = 32,
+        encoder_layers: List[int] = [256, 128, 64],
+        dropout_rate: float = 0.3,
+        section_size: int = 22  # 176 / 8 sections
+    ):
+        super(SurvivalModel, self).__init__()
+        
+        self.attention_k = attention_k
+        self.section_size = section_size
+        
+        # Attention mechanism to reduce from 176 to k vectors
+        self.attention = AttentionMechanism(
+            input_dim=512, 
+            k=attention_k, 
+            section_size=section_size
+        )
+        
+        # Encoder for feature reduction
+        input_dim = attention_k * 512
+        self.encoder = Encoder(input_dim, encoder_layers, dropout_rate)
+        
+        # Survival prediction head - single output for log hazard ratio
+        encoder_output_dim = encoder_layers[-1]
+        self.hazard_head = nn.Sequential(
+            nn.Linear(encoder_output_dim, encoder_output_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(encoder_output_dim // 2, 1)  # Single hazard output
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for survival prediction
+        
+        Args:
+            x: Input tensor of shape (batch_size, 176, 512)
+            
+        Returns:
+            Log hazard ratios of shape (batch_size, 1)
+        """
+        # Apply attention mechanism
+        attended = self.attention(x)  # Shape: (batch_size, k, 512)
+        
+        # Flatten for encoder
+        batch_size = attended.size(0)
+        flattened = attended.view(batch_size, -1)  # Shape: (batch_size, k * 512)
+        
+        # Encode to reduced features
+        features = self.encoder(flattened)  # Shape: (batch_size, encoder_layers[-1])
+        
+        # Predict log hazard ratio
+        log_hazard = self.hazard_head(features)  # Shape: (batch_size, 1)
+        
+        return log_hazard
+
 def create_model(model_type: str, endpoints: List[str] = ['os6', 'os24'], **kwargs) -> nn.Module:
     """Factory function to create models"""
     if model_type == 'autoencoder':
         return AutoEncoderModel(endpoints=endpoints, **kwargs)
     elif model_type == 'endtoend':
         return EndToEndModel(endpoints=endpoints, **kwargs)
+    elif model_type == 'survival':
+        return SurvivalModel(**kwargs)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
