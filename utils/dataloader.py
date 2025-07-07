@@ -6,7 +6,55 @@ from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from typing import List, Dict, Tuple, Optional
 import os
+import warnings
 from collections import Counter
+
+def check_features_for_nan(features_list: List[torch.Tensor], patient_id: str) -> bool:
+    """
+    Check if any features contain NaN values
+    
+    Args:
+        features_list: List of feature tensors for a patient
+        patient_id: Patient identifier for warning messages
+        
+    Returns:
+        True if no NaN values found, False if NaN values detected
+    """
+    for i, feature_tensor in enumerate(features_list):
+        if torch.isnan(feature_tensor).any():
+            warnings.warn(f"WARNING: Patient {patient_id} excluded due to NaN values in feature tensor {i}")
+            return False
+    return True
+
+def filter_patients_with_nan_features(data: List[Dict]) -> List[Dict]:
+    """
+    Filter out patients that have NaN values in their feature tensors
+    
+    Args:
+        data: List of patient data dictionaries
+        
+    Returns:
+        Filtered list of patients without NaN features
+    """
+    filtered_data = []
+    excluded_patients = []
+    
+    for patient in data:
+        patient_id = patient.get('patient_id', 'unknown')
+        features = patient.get('features', [])
+        
+        if check_features_for_nan(features, patient_id):
+            filtered_data.append(patient)
+        else:
+            excluded_patients.append(patient_id)
+    
+    if excluded_patients:
+        print(f"EXCLUDED {len(excluded_patients)} patients due to NaN values in features:")
+        for patient_id in excluded_patients:
+            print(f"  - Patient ID: {patient_id}")
+    
+    print(f"Feature validation: kept {len(filtered_data)} patients, excluded {len(excluded_patients)} patients with NaN features")
+    return filtered_data
 
 def custom_collate_fn(batch):
     """
@@ -69,6 +117,11 @@ class MedicalImagingDataset(Dataset):
         
         # Convert features to tensor
         features = torch.stack(patient['features'])  # Shape: (176, 512)
+        
+        # Additional safety check for NaN values
+        if torch.isnan(features).any():
+            patient_id = patient.get('patient_id', 'unknown')
+            raise ValueError(f"NaN values detected in features for patient {patient_id} during batch creation. This should have been filtered out earlier.")
         
         # Map endpoint names to dict keys
         endpoint_map = {
@@ -354,6 +407,99 @@ def compute_class_weights(data: List[Dict], endpoints: List[str]) -> Dict[str, t
     
     return weights
 
+def filter_patients_with_all_endpoints(data: List[Dict], endpoints: List[str]) -> List[Dict]:
+    """
+    Filter patients to keep only those with all required endpoints
+    
+    Args:
+        data: List of patient data dictionaries
+        endpoints: List of endpoints that must be present
+        
+    Returns:
+        Filtered list of patients with all required endpoints
+    """
+    endpoint_map = {
+        'os6': 'OS_6', 'os24': 'OS_24',
+        'stage_t': 'STAGE_DIAGNOSIS_T',
+        'stage_n': 'STAGE_DIAGNOSIS_N', 
+        'stage_m': 'STAGE_DIAGNOSIS_M'
+    }
+    
+    filtered_data = []
+    excluded_count = 0
+    
+    for patient in data:
+        has_all = True
+        for ep in endpoints:
+            key = endpoint_map[ep]
+            if key not in patient or patient[key] is None:
+                has_all = False
+                break
+        
+        if has_all:
+            filtered_data.append(patient)
+        else:
+            excluded_count += 1
+    
+    print(f"Filtered patients: kept {len(filtered_data)}, excluded {excluded_count} patients missing required endpoints")
+    return filtered_data
+
+def validate_target_values(data: List[Dict], endpoints: List[str], strict_validation: bool = False) -> None:
+    """
+    Validate target values are within expected ranges
+    
+    Args:
+        data: List of patient data dictionaries
+        endpoints: List of endpoints to validate
+        strict_validation: If True, raise error on invalid values. If False, warn only.
+    """
+    endpoint_map = {
+        'os6': 'OS_6', 'os24': 'OS_24',
+        'stage_t': 'STAGE_DIAGNOSIS_T',
+        'stage_n': 'STAGE_DIAGNOSIS_N', 
+        'stage_m': 'STAGE_DIAGNOSIS_M'
+    }
+    
+    invalid_patients = []
+    
+    for patient in data:
+        patient_id = patient.get('patient_id', 'unknown')
+        
+        for ep in endpoints:
+            key = endpoint_map[ep]
+            if key in patient and patient[key] is not None:
+                value = patient[key]
+                
+                # Check value ranges based on endpoint type
+                if ep in ['os6', 'os24', 'stage_m']:  # Binary endpoints
+                    if not (0.0 <= float(value) <= 1.0):
+                        invalid_patients.append({
+                            'patient_id': patient_id,
+                            'endpoint': ep,
+                            'value': value,
+                            'expected_range': '[0.0, 1.0]',
+                            'type': 'binary'
+                        })
+                elif ep in ['stage_t', 'stage_n']:  # Multiclass endpoints
+                    if not (0 <= int(value) <= 10):  # Reasonable range for staging
+                        invalid_patients.append({
+                            'patient_id': patient_id,
+                            'endpoint': ep,
+                            'value': value,
+                            'expected_range': '[0, 10]',
+                            'type': 'multiclass'
+                        })
+    
+    if invalid_patients:
+        error_msg = f"Found {len(invalid_patients)} invalid target values:\n"
+        for inv in invalid_patients:
+            error_msg += f"  Patient {inv['patient_id']}: {inv['endpoint']} = {inv['value']} (expected {inv['expected_range']} for {inv['type']})\n"
+        
+        if strict_validation:
+            raise ValueError(error_msg)
+        else:
+            print(f"WARNING: {error_msg}")
+
 def create_data_loaders(
     pkl_files: List[str],
     split_json: Dict = None,
@@ -362,7 +508,8 @@ def create_data_loaders(
     num_workers: int = 0,
     model_type: str = 'autoencoder',
     endpoints: List[str] = ['os6', 'os24'],
-    random_state: int = 42
+    random_state: int = 42,
+    validate_targets: bool = False
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
     """
     Create train, validation, and test data loaders
@@ -376,12 +523,23 @@ def create_data_loaders(
         model_type: 'autoencoder' or 'endtoend'
         endpoints: List of endpoints to use
         random_state: Random seed
+        validate_targets: If True, validate target values and raise error on invalid values
     
     Returns:
         train_loader, val_loader, test_loader, class_weights
     """
     # Load all data
     all_data = load_pkl_files(pkl_files)
+    
+    # Filter out patients with NaN values in features (before endpoint filtering)
+    all_data = filter_patients_with_nan_features(all_data)
+    
+    # Filter patients to keep only those with all required endpoints
+    all_data = filter_patients_with_all_endpoints(all_data, endpoints)
+    
+    # Validate target values if requested
+    if validate_targets:
+        validate_target_values(all_data, endpoints, strict_validation=True)
     
     # Split data based on whether JSON is provided
     if split_json is not None:
@@ -398,13 +556,10 @@ def create_data_loaders(
             all_data, val_split, endpoints, random_state
         )
     
-    # Determine whether to include missing endpoints
-    include_missing = (model_type == 'autoencoder')
-    
-    # Create datasets
-    train_dataset = MedicalImagingDataset(train_data, include_missing_endpoints=include_missing, endpoints=endpoints)
-    val_dataset = MedicalImagingDataset(val_data, include_missing_endpoints=False, endpoints=endpoints)  # Always exclude for validation
-    test_dataset = MedicalImagingDataset(test_data, include_missing_endpoints=False, endpoints=endpoints)  # Always exclude for test
+    # Since we've already filtered patients with all endpoints, we can set include_missing_endpoints=False for all datasets
+    train_dataset = MedicalImagingDataset(train_data, include_missing_endpoints=False, endpoints=endpoints)
+    val_dataset = MedicalImagingDataset(val_data, include_missing_endpoints=False, endpoints=endpoints)
+    test_dataset = MedicalImagingDataset(test_data, include_missing_endpoints=False, endpoints=endpoints)
     
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 

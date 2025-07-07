@@ -10,6 +10,16 @@ class BalancedBCELoss(nn.Module):
         self.pos_weight = pos_weight
     
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Handle NaN/Inf predictions by replacing with reasonable values
+        if torch.any(torch.isnan(predictions)) or torch.any(torch.isinf(predictions)):
+            print(f"WARNING: Found NaN or Inf in predictions, replacing with 0.5")
+            predictions = torch.where(torch.isnan(predictions) | torch.isinf(predictions), 
+                                    torch.tensor(0.5, dtype=predictions.dtype, device=predictions.device), 
+                                    predictions)
+        
+        # Clamp predictions to safe range to prevent numerical issues
+        predictions = torch.clamp(predictions, 1e-7, 1.0 - 1e-7)
+        
         return F.binary_cross_entropy(predictions, targets, weight=self.pos_weight, reduction='mean')
 
 class CombinedLoss(nn.Module):

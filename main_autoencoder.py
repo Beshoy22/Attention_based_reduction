@@ -70,7 +70,8 @@ def main():
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
         model_type='autoencoder',
         endpoints=args.endpoints,
-        random_state=args.seed
+        random_state=args.seed,
+        validate_targets=args.validate_targets
     )
     
     # Create model

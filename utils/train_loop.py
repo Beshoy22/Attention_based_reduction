@@ -89,6 +89,19 @@ def train_epoch_autoencoder(
         reconstructed, predictions = model(features)
         attended_features = model.attention(features)
         
+        # Debug: Check for NaN in model outputs
+        if torch.any(torch.isnan(reconstructed)):
+            print("WARNING: NaN detected in reconstructed features")
+        
+        for ep, pred in predictions.items():
+            if torch.any(torch.isnan(pred)):
+                print(f"WARNING: NaN detected in predictions for endpoint {ep}")
+                print(f"Prediction stats: min={pred.min().item():.6f}, max={pred.max().item():.6f}, mean={pred.mean().item():.6f}")
+                # Check model parameters for NaN
+                for name, param in model.named_parameters():
+                    if torch.any(torch.isnan(param)):
+                        print(f"NaN detected in parameter {name}")
+        
         # Compute cosine similarity (always use appropriate target for comparison)
         if model.reconstruct_all:
             cos_sim = compute_cosine_similarity(features, reconstructed)
@@ -105,6 +118,10 @@ def train_epoch_autoencoder(
         # Backward pass
         optimizer_manager.zero_grad()
         loss.backward()
+        
+        # Clip gradients to prevent explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer_manager.step()
         
         # Accumulate losses
@@ -164,6 +181,10 @@ def train_epoch_endtoend(
         # Backward pass
         optimizer_manager.zero_grad()
         loss.backward()
+        
+        # Clip gradients to prevent explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer_manager.step()
         
         # Accumulate losses

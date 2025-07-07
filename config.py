@@ -15,6 +15,8 @@ class Config:
                                 help='JSON file with TRAIN_SET and TEST_SET patient_ids (optional)')
         self.parser.add_argument('--val_split', type=float, default=0.2,
                                 help='Validation split from training data (also used as test split if no JSON provided)')
+        self.parser.add_argument('--validate_targets', action='store_true',
+                                help='Validate target values are within expected ranges and raise error on invalid values')
         
         # Model arguments
         self.parser.add_argument('--attention_k', type=int, default=32,
