@@ -214,7 +214,14 @@ def train_epoch_autoencoder(
         targets = prepare_batch_targets(batch, device, endpoints)
         
         # Forward pass
-        reconstructed, predictions = model(features)
+        pet_coronal = batch.get('pet_coronal', None)
+        pet_sagittal = batch.get('pet_sagittal', None)
+        if pet_coronal is not None:
+            pet_coronal = pet_coronal.to(device)
+        if pet_sagittal is not None:
+            pet_sagittal = pet_sagittal.to(device)
+        
+        reconstructed, predictions = model(features, pet_coronal, pet_sagittal)
         attended_features = model.attention(features)
         
         # Debug: Check for NaN in model outputs
@@ -234,14 +241,30 @@ def train_epoch_autoencoder(
         if model.reconstruct_all:
             cos_sim = compute_cosine_similarity(features, reconstructed)
         else:
-            cos_sim = compute_cosine_similarity(attended_features, reconstructed)
+            # Handle PET fusion modes
+            if hasattr(model, 'enable_pet') and model.enable_pet and model.pet_fusion_mode == 'concatenate':
+                # In concatenate mode, only compare CT part (first k vectors) of reconstruction
+                attended_features_shape = attended_features.shape[1]  # k vectors
+                reconstructed_ct_part = reconstructed[:, :attended_features_shape, :]  # First k vectors
+                cos_sim = compute_cosine_similarity(attended_features, reconstructed_ct_part)
+            else:
+                # Normal case or multiply mode
+                cos_sim = compute_cosine_similarity(attended_features, reconstructed)
         cosine_similarities.append(cos_sim)
         
         # Calculate loss
         if model.reconstruct_all:
             loss, loss_dict = criterion(reconstructed, attended_features, predictions, targets, original_input=features)
         else:
-            loss, loss_dict = criterion(reconstructed, attended_features, predictions, targets)
+            # Handle PET fusion modes for reconstruction loss
+            if hasattr(model, 'enable_pet') and model.enable_pet and model.pet_fusion_mode == 'concatenate':
+                # In concatenate mode, only compute reconstruction loss for CT part (first k vectors)
+                attended_features_shape = attended_features.shape[1]  # k vectors
+                reconstructed_ct_part = reconstructed[:, :attended_features_shape, :]  # First k vectors
+                loss, loss_dict = criterion(reconstructed_ct_part, attended_features, predictions, targets)
+            else:
+                # Normal case or multiply mode
+                loss, loss_dict = criterion(reconstructed, attended_features, predictions, targets)
         
         # Backward pass
         optimizer_manager.zero_grad()
@@ -312,7 +335,14 @@ def train_epoch_endtoend(
                 targets[ep] = torch.stack([batch['endpoints'][ep][i] for i in valid_indices]).to(device)
         
         # Forward pass
-        _, predictions = model(features)
+        pet_coronal = batch.get('pet_coronal', None)
+        pet_sagittal = batch.get('pet_sagittal', None)
+        if pet_coronal is not None:
+            pet_coronal = pet_coronal[valid_indices].to(device)
+        if pet_sagittal is not None:
+            pet_sagittal = pet_sagittal[valid_indices].to(device)
+        
+        _, predictions = model(features, pet_coronal, pet_sagittal)
         
         # Calculate loss
         loss, loss_dict = criterion(predictions, targets)
@@ -476,7 +506,14 @@ def evaluate_model(
                         targets[ep] = torch.stack([batch['endpoints'][ep][i] for i in valid_indices]).to(device)
                 
                 # Forward pass
-                _, predictions = model(features)
+                pet_coronal = batch.get('pet_coronal', None)
+                pet_sagittal = batch.get('pet_sagittal', None)
+                if pet_coronal is not None:
+                    pet_coronal = pet_coronal[valid_indices].to(device)
+                if pet_sagittal is not None:
+                    pet_sagittal = pet_sagittal[valid_indices].to(device)
+                
+                _, predictions = model(features, pet_coronal, pet_sagittal)
                 
                 # Calculate loss
                 loss, loss_dict = criterion(predictions, targets)
@@ -518,21 +555,44 @@ def evaluate_model(
                 targets = prepare_batch_targets(batch, device, endpoints)
                 
                 # Forward pass
-                reconstructed, predictions = model(features)
+                pet_coronal = batch.get('pet_coronal', None)
+                pet_sagittal = batch.get('pet_sagittal', None)
+                if pet_coronal is not None:
+                    pet_coronal = pet_coronal.to(device)
+                if pet_sagittal is not None:
+                    pet_sagittal = pet_sagittal.to(device)
+                
+                reconstructed, predictions = model(features, pet_coronal, pet_sagittal)
                 attended_features = model.attention(features)
                 
                 # Compute cosine similarity (always use appropriate target for comparison)
                 if model.reconstruct_all:
                     cos_sim = compute_cosine_similarity(features, reconstructed)
                 else:
-                    cos_sim = compute_cosine_similarity(attended_features, reconstructed)
+                    # Handle PET fusion modes
+                    if hasattr(model, 'enable_pet') and model.enable_pet and model.pet_fusion_mode == 'concatenate':
+                        # In concatenate mode, only compare CT part (first k vectors) of reconstruction
+                        attended_features_shape = attended_features.shape[1]  # k vectors
+                        reconstructed_ct_part = reconstructed[:, :attended_features_shape, :]  # First k vectors
+                        cos_sim = compute_cosine_similarity(attended_features, reconstructed_ct_part)
+                    else:
+                        # Normal case or multiply mode
+                        cos_sim = compute_cosine_similarity(attended_features, reconstructed)
                 cosine_similarities.append(cos_sim)
                 
                 # Calculate loss
                 if model.reconstruct_all:
                     loss, loss_dict = criterion(reconstructed, attended_features, predictions, targets, original_input=features)
                 else:
-                    loss, loss_dict = criterion(reconstructed, attended_features, predictions, targets)
+                    # Handle PET fusion modes for reconstruction loss
+                    if hasattr(model, 'enable_pet') and model.enable_pet and model.pet_fusion_mode == 'concatenate':
+                        # In concatenate mode, only compute reconstruction loss for CT part (first k vectors)
+                        attended_features_shape = attended_features.shape[1]  # k vectors
+                        reconstructed_ct_part = reconstructed[:, :attended_features_shape, :]  # First k vectors
+                        loss, loss_dict = criterion(reconstructed_ct_part, attended_features, predictions, targets)
+                    else:
+                        # Normal case or multiply mode
+                        loss, loss_dict = criterion(reconstructed, attended_features, predictions, targets)
                 
                 # Store predictions for metrics and saving (only for specified endpoints with targets)
                 for ep in endpoints:

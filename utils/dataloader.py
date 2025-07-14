@@ -8,6 +8,7 @@ from typing import List, Dict, Tuple, Optional
 import os
 import warnings
 from collections import Counter
+from .pet_preprocessing import PETPreprocessor, compute_pet_aspect_ratio
 
 def check_features_for_nan(features_list: List[torch.Tensor], patient_id: str) -> bool:
     """
@@ -77,15 +78,31 @@ def custom_collate_fn(batch):
         for ep_name in batch[0]['endpoints'].keys():
             endpoints[ep_name] = [item['endpoints'][ep_name] for item in batch]
     
+    # Handle PET data (can be None)
+    pet_coronal = None
+    pet_sagittal = None
+    
+    pet_coronal_list = [item['pet_coronal'] for item in batch]
+    pet_sagittal_list = [item['pet_sagittal'] for item in batch]
+    
+    # Stack PET data if available for all items in batch
+    if all(pet is not None for pet in pet_coronal_list):
+        pet_coronal = torch.stack(pet_coronal_list)
+    if all(pet is not None for pet in pet_sagittal_list):
+        pet_sagittal = torch.stack(pet_sagittal_list)
+    
     return {
         'features': features,
         'endpoints': endpoints,
         'patient_id': patient_ids,
-        'center': centers
+        'center': centers,
+        'pet_coronal': pet_coronal,
+        'pet_sagittal': pet_sagittal
     }
 
 class MedicalImagingDataset(Dataset):
-    def __init__(self, data: List[Dict], include_missing_endpoints: bool = True, endpoints: List[str] = ['os6', 'os24']):
+    def __init__(self, data: List[Dict], include_missing_endpoints: bool = True, endpoints: List[str] = ['os6', 'os24'], 
+                 pet_preprocessor: Optional[PETPreprocessor] = None):
         """
         Dataset for medical imaging data
         
@@ -93,9 +110,11 @@ class MedicalImagingDataset(Dataset):
             data: List of patient dictionaries
             include_missing_endpoints: Whether to include patients without endpoints
             endpoints: Which endpoints to consider
+            pet_preprocessor: PET preprocessor instance for handling PET images
         """
         self.endpoints = endpoints
         self.data = []
+        self.pet_preprocessor = pet_preprocessor
         
         # Map endpoint names to dict keys
         endpoint_map = {
@@ -194,11 +213,30 @@ class MedicalImagingDataset(Dataset):
                 else:
                     endpoint_values[ep] = None
         
+        # Handle PET data if available
+        pet_coronal = None
+        pet_sagittal = None
+        
+        if self.pet_preprocessor is not None:
+            # Check if patient has PET data
+            if 'coronal_png_path' in patient and 'sagittal_png_path' in patient:
+                try:
+                    pet_coronal, pet_sagittal = self.pet_preprocessor.preprocess_pet_pair(
+                        patient['coronal_png_path'], 
+                        patient['sagittal_png_path']
+                    )
+                except Exception as e:
+                    warnings.warn(f"Failed to load PET data for patient {patient['patient_id']}: {e}")
+                    pet_coronal = None
+                    pet_sagittal = None
+        
         return {
             'features': features,
             'endpoints': endpoint_values,
             'patient_id': patient['patient_id'],
-            'center': patient.get('center', 'unknown')
+            'center': patient.get('center', 'unknown'),
+            'pet_coronal': pet_coronal,
+            'pet_sagittal': pet_sagittal
         }
 
 def load_pkl_files(pkl_files: List[str]) -> List[Dict]:
@@ -605,8 +643,10 @@ def create_data_loaders(
     model_type: str = 'autoencoder',
     endpoints: List[str] = ['os6', 'os24'],
     random_state: int = 42,
-    validate_targets: bool = False
-) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
+    validate_targets: bool = False,
+    enable_pet: bool = False,
+    pet_target_height: int = 300
+) -> Tuple[DataLoader, DataLoader, DataLoader, Dict, Optional[PETPreprocessor]]:
     """
     Create train, validation, and test data loaders
     
@@ -620,12 +660,23 @@ def create_data_loaders(
         endpoints: List of endpoints to use
         random_state: Random seed
         validate_targets: If True, validate target values and raise error on invalid values
+        enable_pet: If True, enable PET data processing
+        pet_target_height: Target height for PET image resizing
     
     Returns:
-        train_loader, val_loader, test_loader, class_weights
+        train_loader, val_loader, test_loader, class_weights, pet_preprocessor
     """
     # Load all data
     all_data = load_pkl_files(pkl_files)
+    
+    # Set up PET preprocessing if enabled
+    pet_preprocessor = None
+    if enable_pet:
+        # Compute aspect ratio from training data
+        aspect_ratio = compute_pet_aspect_ratio(all_data)
+        pet_preprocessor = PETPreprocessor(target_height=pet_target_height, aspect_ratio=aspect_ratio)
+        pet_preprocessor.set_target_dimensions(aspect_ratio)
+        print(f"PET preprocessing enabled with target dimensions: {pet_preprocessor.target_width}x{pet_preprocessor.target_height}")
     
     # Filter out patients with NaN values in features (before endpoint filtering)
     all_data = filter_patients_with_nan_features(all_data)
@@ -653,9 +704,9 @@ def create_data_loaders(
         )
     
     # Since we've already filtered patients with all endpoints, we can set include_missing_endpoints=False for all datasets
-    train_dataset = MedicalImagingDataset(train_data, include_missing_endpoints=False, endpoints=endpoints)
-    val_dataset = MedicalImagingDataset(val_data, include_missing_endpoints=False, endpoints=endpoints)
-    test_dataset = MedicalImagingDataset(test_data, include_missing_endpoints=False, endpoints=endpoints)
+    train_dataset = MedicalImagingDataset(train_data, include_missing_endpoints=False, endpoints=endpoints, pet_preprocessor=pet_preprocessor)
+    val_dataset = MedicalImagingDataset(val_data, include_missing_endpoints=False, endpoints=endpoints, pet_preprocessor=pet_preprocessor)
+    test_dataset = MedicalImagingDataset(test_data, include_missing_endpoints=False, endpoints=endpoints, pet_preprocessor=pet_preprocessor)
     
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
@@ -672,4 +723,4 @@ def create_data_loaders(
     print(f"Validation samples: {len(val_dataset)}")
     print(f"Test samples: {len(test_dataset)}")
     
-    return train_loader, val_loader, test_loader, class_weights
+    return train_loader, val_loader, test_loader, class_weights, pet_preprocessor

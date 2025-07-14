@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Optional
+from .pet_preprocessing import PETEncoder, MultiModalPETFusion
 
 class AttentionMechanism(nn.Module):
     """
@@ -157,19 +158,45 @@ class AutoEncoderModel(nn.Module):
         predictor_layers: List[int] = [64, 32],
         endpoints: List[str] = ['os6', 'os24'],
         dropout_rate: float = 0.3,
-        reconstruct_all: bool = False
+        reconstruct_all: bool = False,
+        enable_pet: bool = False,
+        pet_fusion_mode: str = 'multiply',
+        pet_input_height: int = 300,
+        pet_input_width: int = 300
     ):
         super(AutoEncoderModel, self).__init__()
         
         self.attention_k = attention_k
         self.latent_dim = latent_dim
         self.reconstruct_all = reconstruct_all
+        self.enable_pet = enable_pet
+        self.pet_fusion_mode = pet_fusion_mode
         
         # Attention mechanism
         self.attention = AttentionMechanism(input_dim=512, k=attention_k)
         
+        # PET components
+        if enable_pet:
+            self.pet_encoder = PETEncoder(
+                input_height=pet_input_height,
+                input_width=pet_input_width,
+                output_dim=512
+            )
+            self.pet_fusion = MultiModalPETFusion(
+                fusion_mode=pet_fusion_mode,
+                ct_feature_dim=512,
+                pet_feature_dim=512,
+                attention_k=attention_k
+            )
+            # Update attention_k for concatenation mode
+            effective_k = self.pet_fusion.output_k
+        else:
+            self.pet_encoder = None
+            self.pet_fusion = None
+            effective_k = attention_k
+        
         # Flatten attention output for encoder input
-        encoder_input_dim = attention_k * 512
+        encoder_input_dim = effective_k * 512
         
         # Encoder
         self.encoder = Encoder(encoder_input_dim, encoder_layers + [latent_dim], dropout_rate)
@@ -179,7 +206,7 @@ class AutoEncoderModel(nn.Module):
             # Reconstruct entire input: 176 * 512
             decoder_output_dim = 176 * 512
         else:
-            # Reconstruct only attended features: k * 512
+            # Reconstruct only attended features: effective_k * 512
             decoder_output_dim = encoder_input_dim
         
         self.decoder = Decoder(latent_dim, encoder_layers, decoder_output_dim, dropout_rate)
@@ -187,13 +214,29 @@ class AutoEncoderModel(nn.Module):
         # Predictor
         self.predictor = Predictor(latent_dim, predictor_layers, endpoints, dropout_rate)
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward(self, x: torch.Tensor, pet_coronal: Optional[torch.Tensor] = None, 
+                pet_sagittal: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
         # Apply attention mechanism
         attended_features = self.attention(x)  # Shape: (batch_size, k, 512)
         
+        # PET processing and fusion
+        if self.enable_pet and self.pet_encoder is not None:
+            pet_coronal_features = None
+            pet_sagittal_features = None
+            
+            if pet_coronal is not None:
+                pet_coronal_features = self.pet_encoder(pet_coronal)  # Shape: (batch_size, 512)
+            if pet_sagittal is not None:
+                pet_sagittal_features = self.pet_encoder(pet_sagittal)  # Shape: (batch_size, 512)
+            
+            # Fuse CT and PET features
+            fused_features = self.pet_fusion(attended_features, pet_coronal_features, pet_sagittal_features)
+        else:
+            fused_features = attended_features
+        
         # Flatten for encoder
-        batch_size = attended_features.size(0)
-        flattened = attended_features.view(batch_size, -1)  # Shape: (batch_size, k*512)
+        batch_size = fused_features.size(0)
+        flattened = fused_features.view(batch_size, -1)  # Shape: (batch_size, effective_k*512)
         
         # Encode to latent space
         latent = self.encoder(flattened)  # Shape: (batch_size, latent_dim)
@@ -205,8 +248,9 @@ class AutoEncoderModel(nn.Module):
             # Reconstruct entire input: (batch_size, 176, 512)
             reconstructed = reconstructed_flat.view(batch_size, 176, 512)
         else:
-            # Reconstruct only attended features: (batch_size, k, 512)
-            reconstructed = reconstructed_flat.view(batch_size, self.attention_k, 512)
+            # Reconstruct only attended features: (batch_size, effective_k, 512)
+            effective_k = fused_features.size(1)
+            reconstructed = reconstructed_flat.view(batch_size, effective_k, 512)
         
         # Predict endpoints
         predictions = self.predictor(latent)
@@ -223,29 +267,71 @@ class EndToEndModel(nn.Module):
         encoder_layers: List[int] = [256, 128, 64],
         predictor_layers: List[int] = [64, 32],
         endpoints: List[str] = ['os6', 'os24'],
-        dropout_rate: float = 0.3
+        dropout_rate: float = 0.3,
+        enable_pet: bool = False,
+        pet_fusion_mode: str = 'multiply',
+        pet_input_height: int = 300,
+        pet_input_width: int = 300
     ):
         super(EndToEndModel, self).__init__()
         
         self.attention_k = attention_k
+        self.enable_pet = enable_pet
+        self.pet_fusion_mode = pet_fusion_mode
         
         # Attention mechanism
         self.attention = AttentionMechanism(input_dim=512, k=attention_k)
         
+        # PET components
+        if enable_pet:
+            self.pet_encoder = PETEncoder(
+                input_height=pet_input_height,
+                input_width=pet_input_width,
+                output_dim=512
+            )
+            self.pet_fusion = MultiModalPETFusion(
+                fusion_mode=pet_fusion_mode,
+                ct_feature_dim=512,
+                pet_feature_dim=512,
+                attention_k=attention_k
+            )
+            # Update attention_k for concatenation mode
+            effective_k = self.pet_fusion.output_k
+        else:
+            self.pet_encoder = None
+            self.pet_fusion = None
+            effective_k = attention_k
+        
         # Feature encoder
-        encoder_input_dim = attention_k * 512
+        encoder_input_dim = effective_k * 512
         self.encoder = Encoder(encoder_input_dim, encoder_layers, dropout_rate)
         
         # Predictor (using second-to-last layer as reduced features)
         self.predictor = Predictor(encoder_layers[-1], predictor_layers, endpoints, dropout_rate)
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward(self, x: torch.Tensor, pet_coronal: Optional[torch.Tensor] = None, 
+                pet_sagittal: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
         # Apply attention mechanism
         attended_features = self.attention(x)  # Shape: (batch_size, k, 512)
         
+        # PET processing and fusion
+        if self.enable_pet and self.pet_encoder is not None:
+            pet_coronal_features = None
+            pet_sagittal_features = None
+            
+            if pet_coronal is not None:
+                pet_coronal_features = self.pet_encoder(pet_coronal)  # Shape: (batch_size, 512)
+            if pet_sagittal is not None:
+                pet_sagittal_features = self.pet_encoder(pet_sagittal)  # Shape: (batch_size, 512)
+            
+            # Fuse CT and PET features
+            fused_features = self.pet_fusion(attended_features, pet_coronal_features, pet_sagittal_features)
+        else:
+            fused_features = attended_features
+        
         # Flatten for encoder
-        batch_size = attended_features.size(0)
-        flattened = attended_features.view(batch_size, -1)  # Shape: (batch_size, k*512)
+        batch_size = fused_features.size(0)
+        flattened = fused_features.view(batch_size, -1)  # Shape: (batch_size, effective_k*512)
         
         # Encode to reduced features
         features = self.encoder(flattened)  # Shape: (batch_size, encoder_layers[-1])

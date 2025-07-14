@@ -44,7 +44,7 @@ def main():
     
     # Create data loaders
     print("Creating data loaders...")
-    train_loader, val_loader, test_loader, class_weights = create_data_loaders(
+    train_loader, val_loader, test_loader, class_weights, pet_preprocessor = create_data_loaders(
         pkl_files=args.pkl_files,
         split_json=split_data,
         val_split=args.val_split,
@@ -53,18 +53,31 @@ def main():
         model_type='endtoend',
         endpoints=args.endpoints,
         random_state=args.seed,
-        validate_targets=args.validate_targets
+        validate_targets=args.validate_targets,
+        enable_pet=args.enable_pet if hasattr(args, 'enable_pet') else False,
+        pet_target_height=args.pet_target_height if hasattr(args, 'pet_target_height') else 300
     )
     
     # Create model
     print("Creating end-to-end model...")
+    
+    # Get PET dimensions if PET is enabled
+    pet_height = pet_width = 300  # Default
+    if hasattr(args, 'enable_pet') and args.enable_pet and pet_preprocessor is not None:
+        pet_height = pet_preprocessor.target_height
+        pet_width = pet_preprocessor.target_width
+    
     model = create_model(
         model_type='endtoend',
         endpoints=args.endpoints,
         attention_k=args.attention_k,
         encoder_layers=args.encoder_layers,
         predictor_layers=args.predictor_layers,
-        dropout_rate=args.dropout_rate
+        dropout_rate=args.dropout_rate,
+        enable_pet=args.enable_pet if hasattr(args, 'enable_pet') else False,
+        pet_fusion_mode=args.pet_fusion_mode if hasattr(args, 'pet_fusion_mode') else 'multiply',
+        pet_input_height=pet_height,
+        pet_input_width=pet_width
     ).to(device)
     
     print(f"Model parameters: {count_parameters(model):,}")

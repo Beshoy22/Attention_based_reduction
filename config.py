@@ -32,6 +32,15 @@ class Config:
         self.parser.add_argument('--dropout_rate', type=float, default=0.3,
                                 help='Dropout rate')
         
+        # PET arguments
+        self.parser.add_argument('--enable_pet', action='store_true',
+                                help='Enable PET scan integration')
+        self.parser.add_argument('--pet_fusion_mode', type=str, choices=['multiply', 'concatenate'], 
+                                default='multiply',
+                                help='PET fusion mode: multiply (element-wise) or concatenate (add 2 vectors)')
+        self.parser.add_argument('--pet_target_height', type=int, default=300,
+                                help='Target height for PET image resizing')
+        
         # Training arguments
         self.parser.add_argument('--endpoints', nargs='+', 
                                 choices=['os6', 'os24', 'stage_t', 'stage_n', 'stage_m', 'survival'], 

@@ -83,14 +83,14 @@ class GridSearch:
                     val_split=self.base_args.val_split,
                     batch_size=params.get('batch_size', self.base_args.batch_size),
                     num_workers=0,
-                    model_type=self.base_args.model_type,
+                    model_type='autoencoder',
                     endpoints=self.base_args.endpoints,
                     random_state=42
                 )
                 
                 # Create model
                 model = create_model(
-                    model_type=self.base_args.model_type,
+                    model_type='autoencoder',
                     endpoints=self.base_args.endpoints,
                     attention_k=params.get('attention_k', self.base_args.attention_k),
                     encoder_layers=params.get('encoder_layers', self.base_args.encoder_layers),
@@ -100,7 +100,7 @@ class GridSearch:
                 ).to(device)
                 
                 # Create loss and optimizer
-                if self.base_args.model_type == 'autoencoder':
+                if True:
                     criterion = CombinedLoss(
                         class_weights=class_weights,
                         reconstruction_weight=params.get('reconstruction_weight', self.base_args.reconstruction_weight),
@@ -132,7 +132,7 @@ class GridSearch:
                     optimizer_manager=optimizer_manager,
                     epochs=max_epochs,
                     device=device,
-                    model_type=self.base_args.model_type,
+                    model_type='autoencoder',
                     endpoints=self.base_args.endpoints,
                     save_dir=combo_dir,
                     save_best=True
@@ -203,7 +203,10 @@ class GridSearch:
             
             rows.append(row)
         
-        return pd.DataFrame(rows).sort_values('score', ascending=False)
+        df = pd.DataFrame(rows)
+        if not df.empty and 'score' in df.columns:
+            return df.sort_values('score', ascending=False)
+        return df
     
     def get_top_models(self, n: int = 2) -> List[Dict]:
         """Get top n models by score"""
@@ -234,14 +237,14 @@ class GridSearch:
                     val_split=self.base_args.val_split,
                     batch_size=params.get('batch_size', self.base_args.batch_size),
                     num_workers=0,
-                    model_type=self.base_args.model_type,
+                    model_type='autoencoder',
                     endpoints=self.base_args.endpoints,
                     random_state=42
                 )
                 
                 # Recreate and load model
                 model = create_model(
-                    model_type=self.base_args.model_type,
+                    model_type='autoencoder',
                     attention_k=params.get('attention_k', self.base_args.attention_k),
                     encoder_layers=params.get('encoder_layers', self.base_args.encoder_layers),
                     latent_dim=params.get('latent_dim', self.base_args.latent_dim),
@@ -254,7 +257,7 @@ class GridSearch:
                 model.load_state_dict(checkpoint['model_state_dict'])
                 
                 # Create criterion
-                if self.base_args.model_type == 'autoencoder':
+                if True:
                     criterion = CombinedLoss(
                         class_weights=class_weights,
                         reconstruction_weight=params.get('reconstruction_weight', self.base_args.reconstruction_weight),
@@ -271,7 +274,7 @@ class GridSearch:
                     dataloader=test_loader,
                     criterion=criterion,
                     device=device,
-                    model_type=self.base_args.model_type,
+                    model_type='autoencoder',
                     endpoints=self.base_args.endpoints
                 )
                 
@@ -306,25 +309,26 @@ def main():
     
     # Define parameter grid
     param_grid = {
-        'attention_k': [16, 32, 64],
-        'latent_dim': [64, 128, 256],
-        'encoder_layers': [[128, 64], [256, 128], [512, 256, 128]],
+        'attention_k': [8, 11, 16, 22],
+        'latent_dim': [128, 256, 512],
+        'encoder_layers': [[128, 64], [256, 128], [256, 128, 64]],
         'predictor_layers': [[32, 16], [64, 32], [128, 64, 32]],
-        'dropout_rate': [0.2, 0.3, 0.4],
-        'learning_rate': [1e-4, 5e-4, 1e-3],
-        'batch_size': [8, 16, 32]
+        'dropout_rate': [0.3, 0.4],
+        'learning_rate': [1e-4, 1e-3],
+        'batch_size': [32, 64],
+        'patience': [50]
     }
     
     # Add model-specific parameters
-    if args.model_type == 'autoencoder':
+    if True:
         param_grid.update({
-            'reconstruction_weight': [0.5, 1.0, 2.0],
-            'prediction_weight': [0.5, 1.0, 2.0]
+            'reconstruction_weight': [0.01, 0.10],
+            'prediction_weight': [1.0]
         })
     
     # Create save directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = os.path.join(args.save_dir, f"gridsearch_{args.model_type}_{timestamp}")
+    save_dir = os.path.join(args.save_dir, f"gridsearch_autoencoder_{timestamp}")
     
     # Run grid search
     grid_search = GridSearch(args, param_grid, save_dir)
